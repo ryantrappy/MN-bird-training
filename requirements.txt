@@ -1,0 +1,13 @@
+# Core ML & utilities
+torch
+torchvision
+pandas
+requests
+Pillow
+tqdm
+onnx
+onnxruntime
+onnxscript
+
+# Note: Installing torch/torchvision is platform-specific. For GPU or specific CUDA builds,
+# follow instructions at https://pytorch.org/get-started/locally/ and install the matching wheel.

@@ -1,0 +1,1 @@
+gbifid	datasetkey	identifier	references	title	description	spatial	latitude	longitude	`format`	created	creator	contributor	publisher	audience	license	rightsholder	datasetid
