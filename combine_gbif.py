@@ -34,22 +34,35 @@ def stream_multimedia_and_write(multimedia_path, verbatim_map, out_path):
          open(out_path, "w", encoding="utf-8", newline="") as of:
         reader = csv.DictReader(mf, delimiter='\t')
         writer = csv.writer(of)
-        writer.writerow(["gbifID", "scientificName", "identifier"])
+        # include format field from multimedia.txt (some files call it `format`)
+        writer.writerow(["gbifID", "scientificName", "identifier", "format"])
         for row in reader:
             gbif = row.get('gbifID') or row.get('gbifid')
             if not gbif:
                 continue
+            # fetch format/type fields (multimedia exports vary): check 'type', 'format', '`format`'
+            media_type = (row.get('type') or row.get('Type') or row.get('format') or row.get('`format`') or '').strip()
             identifier_field = row.get('identifier', '')
-            # If identifier contains multiple values separated by ; or |, split them
+
+            # helper to decide whether this media should be included: require StillImage or image-like
+            def is_still_image(media_type_str, identifier_str):
+                if media_type_str:
+                    t = media_type_str.lower()
+                    return 'still' in t or 'image' in t
+                # fallback: check identifier extension for common image types
+                id_low = (identifier_str or '').lower()
+                for ext in ('.jpg', '.jpeg', '.png', '.gif', '.tif', '.tiff', '.bmp', '.webp'):
+                    if id_low.endswith(ext):
+                        return True
+                return False
+
             if not identifier_field:
-                # still write a row with empty identifier to preserve the relation
-                sci = verbatim_map.get(gbif, '')
-                writer.writerow([gbif, sci, ''])
+                # if no identifier URL, skip unless we still want to preserve relation; skip per user's request
                 continue
-            # Split on common separators, but avoid splitting URLs containing | rarely
+
+            # split identifiers into parts if multiple
             parts = []
             if '|' in identifier_field and ';' in identifier_field:
-                # both exist -> split on both
                 import re
                 parts = re.split(r'[|;]', identifier_field)
             elif '|' in identifier_field:
@@ -58,12 +71,16 @@ def stream_multimedia_and_write(multimedia_path, verbatim_map, out_path):
                 parts = identifier_field.split(';')
             else:
                 parts = [identifier_field]
+
             for p in parts:
                 p = p.strip()
                 if not p:
                     continue
+                # only include if StillImage or image-like
+                if not is_still_image(media_type, p):
+                    continue
                 sci = verbatim_map.get(gbif, '')
-                writer.writerow([gbif, sci, p])
+                writer.writerow([gbif, sci, p, media_type])
 
 
 def parse_args():

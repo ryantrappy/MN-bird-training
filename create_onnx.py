@@ -167,6 +167,7 @@ DM = DownloadManager()
 
 def download_images_to_disk(csv_path, out_dir, url_col="imageLink", label_col="scientificName", test_entries=0, timeout=10, force=False):
     df = pd.read_csv(csv_path)
+    # auto-detect url/label columns if not provided
     if url_col not in df.columns or label_col not in df.columns:
         candidates_url = [c for c in df.columns if "image" in c.lower() or 'identifier' in c.lower()]
         candidates_label = [c for c in df.columns if "scientific" in c.lower() or "name" in c.lower()]
@@ -174,17 +175,38 @@ def download_images_to_disk(csv_path, out_dir, url_col="imageLink", label_col="s
             url_col = candidates_url[0]
         if candidates_label:
             label_col = candidates_label[0]
+    # detect format column if present
+    format_col = next((c for c in df.columns if 'format' in c.lower() or '`format`' in c.lower()), None)
+
     out_dir = pathlib.Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     count = 0
-    for r in tqdm(df.itertuples(index=False), total=len(df), desc="download rows"):
+    records = df.to_dict('records')
+    for r in tqdm(records, total=len(records), desc="download rows"):
         if test_entries and count >= test_entries:
             break
-        url = getattr(r, url_col) if hasattr(r, url_col) else r[0]
-        label = getattr(r, label_col) if hasattr(r, label_col) else "unknown"
+        url = r.get(url_col) or r.get('identifier') or ''
+        label = r.get(label_col, 'unknown')
         if pd.isna(url) or str(url).strip() in ("", "nan", "None"):
             continue
         url = str(url)
+        # only download images hosted on the inaturalist-open-data S3 bucket
+        is_exempt = DM.is_exempt_url(url) if hasattr(DM, 'is_exempt_url') else False
+        if not is_exempt:
+            # per request: do not download non-open-data images at all
+            continue
+        # ensure media type is StillImage (use format/type column if available, else fallback to extension)
+        media_type = (r.get('type') or r.get('Type') or (r.get(format_col) if format_col else '') or '').strip()
+        def is_still_image(media_type_str, url_str):
+            if media_type_str:
+                t = media_type_str.lower()
+                return 'still' in t or 'image' in t
+            # fallback: check extension
+            l = url_str.lower()
+            return any(l.endswith(ext) for ext in ('.jpg', '.jpeg', '.png', '.gif', '.tif', '.tiff', '.bmp', '.webp'))
+        if not is_still_image(media_type, url):
+            continue
+
         label = safe_label(str(label if not pd.isna(label) else "unknown"))
         label_dir = out_dir / label
         label_dir.mkdir(parents=True, exist_ok=True)
@@ -195,23 +217,14 @@ def download_images_to_disk(csv_path, out_dir, url_col="imageLink", label_col="s
             count += 1
             continue
         try:
-            # skip rate limits for inaturalist-open-data S3
-            is_exempt = DM.is_exempt_url(url) if hasattr(DM, 'is_exempt_url') else False
-            if not is_exempt:
-                DM.wait_for_api_slot()
+            # for exempt URLs, do not apply rate limits
             resp = DM.session.get(url, timeout=timeout)
-            if not is_exempt:
-                DM.record_api()
             if resp.status_code == 200:
                 content = resp.content
-                # ensure media quotas for non-exempt URLs
-                if not is_exempt:
-                    DM.wait_for_media_space(len(content))
                 try:
                     img = Image.open(io.BytesIO(content)).convert('RGB')
                     img.save(path)
-                    if not is_exempt:
-                        DM.record_media(len(content))
+                    # do not record media or api usage for exempt S3
                     count += 1
                 except Exception:
                     # corrupted image or unsupported format
@@ -236,16 +249,36 @@ class StreamingImageDataset(Dataset):
                 url_col = candidates_url[0]
             if candidates_label:
                 label_col = candidates_label[0]
+        # detect format column if present
+        format_col = next((c for c in df.columns if 'format' in c.lower() or '`format`' in c.lower()), None)
+
         self.transform = transform
         self.rows = []
-        for i, row in enumerate(df.itertuples(index=False)):
+        records = df.to_dict('records')
+        for i, row in enumerate(records):
             if test_entries and i >= test_entries:
                 break
-            url = getattr(row, url_col) if hasattr(row, url_col) else row[0]
-            label = getattr(row, label_col) if hasattr(row, label_col) else 'unknown'
+            url = row.get(url_col) or row.get('identifier') or ''
+            label = row.get(label_col, 'unknown')
             if pd.isna(url) or str(url).strip() in ('', 'nan', 'None'):
                 continue
-            self.rows.append((str(url), safe_label(str(label if not pd.isna(label) else 'unknown'))))
+            url = str(url)
+            # only include inaturalist-open-data S3 URLs per request
+            is_exempt = DM.is_exempt_url(url) if hasattr(DM, 'is_exempt_url') else False
+            if not is_exempt:
+                continue
+            # check media format/type
+            media_type = (row.get('type') or row.get('Type') or (row.get(format_col) if format_col else '') or '').strip()
+            def is_still_image(media_type_str, url_str):
+                if media_type_str:
+                    t = media_type_str.lower()
+                    return 'still' in t or 'image' in t
+                l = url_str.lower()
+                return any(l.endswith(ext) for ext in ('.jpg', '.jpeg', '.png', '.gif', '.tif', '.tiff', '.bmp', '.webp'))
+            if not is_still_image(media_type, url):
+                continue
+
+            self.rows.append((url, safe_label(str(label if not pd.isna(label) else 'unknown'))))
         # map labels to idx
         labels = sorted({l for _, l in self.rows})
         self.class_to_idx = {c: i for i, c in enumerate(labels)}
