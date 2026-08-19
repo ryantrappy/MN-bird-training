@@ -20,6 +20,7 @@ import os
 import pathlib
 import sys
 from collections import OrderedDict
+from urllib.parse import urlparse
 
 import pandas as pd
 import requests
@@ -78,6 +79,21 @@ class DownloadManager:
         self.usage['media'] = [m for m in self.usage.get('media', []) if m[0] >= day_ago]
         # keep media entries only last day (we'll filter by hour/day when needed)
         self._save_usage()
+
+    def is_exempt_url(self, url: str) -> bool:
+        """Return True for URLs that are hosted in the inaturalist-open-data S3 bucket.
+        This allows bypassing any rate limiting for those URLs.
+        """
+        try:
+            p = urlparse(url)
+            netloc = (p.netloc or '').lower()
+            path = (p.path or '').lower()
+            # common patterns: inaturalist-open-data.s3.amazonaws.com or s3.amazonaws.com/.../inaturalist-open-data
+            if 'inaturalist-open-data' in netloc or '/inaturalist-open-data/' in path or 'inaturalist-open-data' in path:
+                return True
+        except Exception:
+            pass
+        return False
 
     def _count_api_since(self, seconds):
         cutoff = time.time() - seconds
@@ -179,18 +195,23 @@ def download_images_to_disk(csv_path, out_dir, url_col="imageLink", label_col="s
             count += 1
             continue
         try:
-            # respect API rate limits
-            DM.wait_for_api_slot()
+            # skip rate limits for inaturalist-open-data S3
+            is_exempt = DM.is_exempt_url(url) if hasattr(DM, 'is_exempt_url') else False
+            if not is_exempt:
+                DM.wait_for_api_slot()
             resp = DM.session.get(url, timeout=timeout)
-            DM.record_api()
+            if not is_exempt:
+                DM.record_api()
             if resp.status_code == 200:
                 content = resp.content
-                # ensure media quotas
-                DM.wait_for_media_space(len(content))
+                # ensure media quotas for non-exempt URLs
+                if not is_exempt:
+                    DM.wait_for_media_space(len(content))
                 try:
                     img = Image.open(io.BytesIO(content)).convert('RGB')
                     img.save(path)
-                    DM.record_media(len(content))
+                    if not is_exempt:
+                        DM.record_media(len(content))
                     count += 1
                 except Exception:
                     # corrupted image or unsupported format
@@ -239,21 +260,26 @@ class StreamingImageDataset(Dataset):
 
     def _download_and_transform(self, url):
         try:
-            # respect API rate limits
-            DM.wait_for_api_slot()
+            # skip rate limits for inaturalist-open-data S3
+            is_exempt = DM.is_exempt_url(url) if hasattr(DM, 'is_exempt_url') else False
+            if not is_exempt:
+                DM.wait_for_api_slot()
             resp = DM.session.get(url, timeout=self.timeout)
-            DM.record_api()
+            if not is_exempt:
+                DM.record_api()
             if resp.status_code == 200:
                 content = resp.content
-                # respect media quotas
-                DM.wait_for_media_space(len(content))
+                # enforce media quotas for non-exempt URLs
+                if not is_exempt:
+                    DM.wait_for_media_space(len(content))
                 try:
                     img = Image.open(io.BytesIO(content)).convert('RGB')
                     if self.transform:
                         tensor = self.transform(img)
                     else:
                         tensor = transforms.ToTensor()(img)
-                    DM.record_media(len(content))
+                    if not is_exempt:
+                        DM.record_media(len(content))
                     return tensor
                 except Exception:
                     return torch.zeros(3, 224, 224)
