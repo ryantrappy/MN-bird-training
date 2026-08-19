@@ -1,6 +1,7 @@
 # Core ML & utilities
-torch
-torchvision
+# NOTE: On Linux servers, torch/torchvision should usually be installed from the PyTorch
+# Linux wheel index that matches your CUDA/CPU setup. The project can still list them here,
+# but the exact build may need to be overridden for your server.
 pandas
 requests
 Pillow
@@ -8,6 +9,14 @@ tqdm
 onnx
 onnxruntime
 onnxscript
+aiohttp
+aiofiles
 
-# Note: Installing torch/torchvision is platform-specific. For GPU or specific CUDA builds,
-# follow instructions at https://pytorch.org/get-started/locally/ and install the matching wheel.
+torch
+torchvision
+
+# Installation note:
+# - CPU-only Linux: pip install -r requirements.txt
+# - CUDA-enabled Linux: install the matching torch/torchvision wheel from
+#   https://pytorch.org/get-started/locally/ first, then pip install -r requirements.txt
+#   (or use a pinned index URL for your CUDA build).
