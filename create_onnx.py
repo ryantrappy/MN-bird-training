@@ -33,6 +33,14 @@ import torch.optim as optim
 from torch.utils.data import DataLoader, Dataset, random_split
 from torchvision import datasets, models, transforms
 
+# async downloader for fast S3 downloads
+import asyncio
+import aiohttp
+import aiofiles
+import tempfile
+import os
+from tqdm import tqdm
+
 
 def safe_label(s):
     return "".join(c if c.isalnum() or c in "._-" else "_" for c in s)[:200]
@@ -165,7 +173,7 @@ class DownloadManager:
 DM = DownloadManager()
 
 
-def download_images_to_disk(csv_path, out_dir, url_col="imageLink", label_col="scientificName", test_entries=0, timeout=10, force=False):
+def download_images_to_disk(csv_path, out_dir, url_col="imageLink", label_col="scientificName", test_entries=0, timeout=10, force=False, concurrency=64):
     df = pd.read_csv(csv_path)
     # auto-detect url/label columns if not provided
     if url_col not in df.columns or label_col not in df.columns:
@@ -180,11 +188,10 @@ def download_images_to_disk(csv_path, out_dir, url_col="imageLink", label_col="s
 
     out_dir = pathlib.Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    count = 0
+    # collect entries to download concurrently
+    entries = []
     records = df.to_dict('records')
-    for r in tqdm(records, total=len(records), desc="download rows"):
-        if test_entries and count >= test_entries:
-            break
+    for r in records:
         url = r.get(url_col) or r.get('identifier') or ''
         label = r.get(label_col, 'unknown')
         if pd.isna(url) or str(url).strip() in ("", "nan", "None"):
@@ -214,24 +221,76 @@ def download_images_to_disk(csv_path, out_dir, url_col="imageLink", label_col="s
         fname = hashlib.sha1(url.encode('utf8')).hexdigest()[:16] + suffix
         path = label_dir / fname
         if path.exists() and not force:
-            count += 1
             continue
-        try:
-            # for exempt URLs, do not apply rate limits
-            resp = DM.session.get(url, timeout=timeout)
-            if resp.status_code == 200:
-                content = resp.content
-                try:
-                    img = Image.open(io.BytesIO(content)).convert('RGB')
-                    img.save(path)
-                    # do not record media or api usage for exempt S3
-                    count += 1
-                except Exception:
-                    # corrupted image or unsupported format
-                    continue
-        except Exception:
-            continue
-    print(f"Downloaded approx {count} images to {out_dir}")
+        entries.append((url, path))
+        if test_entries and len(entries) >= test_entries:
+            break
+
+    # async downloader
+    async def _fetch(session, sem, url, path, timeout, retries=3):
+        backoff = 1.0
+        for attempt in range(retries):
+            try:
+                async with sem:
+                    async with session.get(url, timeout=aiohttp.ClientTimeout(total=timeout)) as resp:
+                        if resp.status == 200:
+                            data = await resp.read()
+                            tmp = str(path) + '.tmp'
+                            try:
+                                async with aiofiles.open(tmp, 'wb') as f:
+                                    await f.write(data)
+                                os.replace(tmp, str(path))
+                                return True
+                            finally:
+                                # cleanup tmp if exists
+                                try:
+                                    if os.path.exists(tmp):
+                                        os.remove(tmp)
+                                except Exception:
+                                    pass
+                        else:
+                            # non-200, treat as failure to allow retry
+                            pass
+            except Exception:
+                await asyncio.sleep(backoff)
+                backoff *= 2
+        return False
+
+    async def _download_all(entries, concurrency, timeout):
+        if not entries:
+            return 0
+        connector = aiohttp.TCPConnector(limit_per_host=concurrency)
+        sem = asyncio.Semaphore(concurrency)
+        success = 0
+        async with aiohttp.ClientSession(connector=connector) as session:
+            tasks = [asyncio.create_task(_fetch(session, sem, url, path, timeout)) for url, path in entries]
+            for f in tqdm(asyncio.as_completed(tasks), total=len(tasks), desc='downloading'):
+                res = await f
+                if res:
+                    success += 1
+        return success
+
+    # run event loop
+    try:
+        downloaded = asyncio.run(_download_all(entries, concurrency=64, timeout=timeout))
+    except RuntimeError:
+        # already running event loop (rare in some environments), fall back to synchronous download
+        downloaded = 0
+        for url, path in tqdm(entries, desc='download (fallback)'):
+            try:
+                resp = DM.session.get(url, timeout=timeout)
+                if resp.status_code == 200:
+                    content = resp.content
+                    try:
+                        img = Image.open(io.BytesIO(content)).convert('RGB')
+                        img.save(path)
+                        downloaded += 1
+                    except Exception:
+                        continue
+            except Exception:
+                continue
+
+    print(f"Downloaded approx {downloaded} images to {out_dir}")
 
 
 class StreamingImageDataset(Dataset):
@@ -472,6 +531,7 @@ def main():
     p.add_argument('--api-per-day', type=int, default=10000, help='Max API requests per day (default 10000)')
     p.add_argument('--media-hourly-gb', type=float, default=5.0, help='Max media download GB per hour (default 5)')
     p.add_argument('--media-daily-gb', type=float, default=24.0, help='Max media download GB per day (default 24)')
+    p.add_argument('--concurrency', type=int, default=64, help='Concurrent downloads for S3 (default 64)')
 
     args = p.parse_args()
 
@@ -491,7 +551,7 @@ def main():
     # disk mode
     if args.test_entries:
         print(f'Disk mode: will download up to {args.test_entries} entries')
-    download_images_to_disk(args.csv, args.data_dir, url_col=args.url_col, label_col=args.label_col, test_entries=args.test_entries)
+    download_images_to_disk(args.csv, args.data_dir, url_col=args.url_col, label_col=args.label_col, test_entries=args.test_entries, timeout=10, force=False, concurrency=args.concurrency)
     if args.download_only:
         print('Download finished. Images at', args.data_dir)
         return
